@@ -8,6 +8,7 @@ RUN apk add --no-cache curl jq
 ENV CF_API_TOKEN=""
 ENV DNS_RECORD_NAME=""
 ENV CHECK_INTERVAL_MINUTES="10"
+ENV IP_VERSION="4"
 
 # Copy the shell script into the Docker container
 COPY update_dns.sh /usr/local/bin/update_dns.sh

@@ -3,121 +3,171 @@
 # Cloudflare API Token (must have permissions to edit DNS records)
 CF_API_TOKEN="${CF_API_TOKEN}"
 DNS_RECORD_NAME="${DNS_RECORD_NAME}"
-CHECK_INTERVAL_MINUTES="${CHECK_INTERVAL_MINUTES:-10}"  # Default to 10 minutes if not specified
+CHECK_INTERVAL_MINUTES="${CHECK_INTERVAL_MINUTES:-10}"
+IP_VERSION="${IP_VERSION:-4}"
 
 # Convert minutes to seconds
 CHECK_INTERVAL_SECONDS=$((CHECK_INTERVAL_MINUTES * 60))
 
-# Function to get the public IP address of the Raspberry Pi
-get_public_ip() {
-    curl -s https://checkip.amazonaws.com
+validate_configuration() {
+    if [ -z "${CF_API_TOKEN}" ] || [ -z "${DNS_RECORD_NAME}" ]; then
+        echo "CF_API_TOKEN and DNS_RECORD_NAME environment variables are required."
+        exit 1
+    fi
+
+    case "${IP_VERSION}" in
+        4|6|4,6|6,4)
+            ;;
+        *)
+            echo "Invalid IP_VERSION value: ${IP_VERSION}. Supported values are 4, 6, and 4,6."
+            exit 1
+            ;;
+    esac
 }
 
-# Function to get all zones in the Cloudflare account
+# Get the public IP address for the requested IP version.
+get_public_ip() {
+    local ip_version="$1"
+
+    if [ "${ip_version}" = "4" ]; then
+        curl -4 -fsS https://api.ipify.org
+    else
+        curl -6 -fsS https://api6.ipify.org
+    fi
+}
+
+# Get all zones in the Cloudflare account.
 get_zones() {
-    curl -s -X GET "https://api.cloudflare.com/client/v4/zones" \
+    curl -fsS -X GET "https://api.cloudflare.com/client/v4/zones" \
         -H "Authorization: Bearer ${CF_API_TOKEN}" \
         -H "Content-Type: application/json"
 }
 
-# Function to get DNS records for a specific zone
+# Get DNS records for a specific zone.
 get_dns_records() {
     local zone_id="$1"
-    curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records" \
+
+    curl -fsS -X GET "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records" \
         -H "Authorization: Bearer ${CF_API_TOKEN}" \
         -H "Content-Type: application/json"
 }
 
-# Function to get the current IP address of the DNS A record
-get_current_record_ip() {
-    local zone_id="$1"
-    local record_name="$2"
-    
-    # Get all DNS records for the zone
-    records=$(get_dns_records "${zone_id}")
-    
-    # Filter A record by name
-    echo "${records}" | jq -r ".result[] | select(.type == \"A\" and .name == \"${record_name}\") | .content"
-}
-
-# Function to get the ID of an A record by name
-get_record_id_by_name() {
-    local zone_id="$1"
-    local record_name="$2"
-    
-    # Get all DNS records for the zone
-    records=$(get_dns_records "${zone_id}")
-    
-    # Find the record ID of the A record
-    echo "${records}" | jq -r ".result[] | select(.type == \"A\" and .name == \"${record_name}\") | .id"
-}
-
-# Function to update the A record to the new IP address
+# Update an A or AAAA record to the new IP address.
 update_dns_record() {
     local zone_id="$1"
     local record_id="$2"
-    local new_ip="$3"
-    
-    curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${record_id}" \
+    local record_type="$3"
+    local new_ip="$4"
+
+    curl -fsS -X PUT "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${record_id}" \
         -H "Authorization: Bearer ${CF_API_TOKEN}" \
         -H "Content-Type: application/json" \
-        --data '{"type":"A","name":"'"${DNS_RECORD_NAME}"'","content":"'"${new_ip}"'","ttl":1,"proxied":false}'
+        --data '{"type":"'"${record_type}"'","name":"'"${DNS_RECORD_NAME}"'","content":"'"${new_ip}"'","ttl":1,"proxied":false}'
 }
 
-# Main script logic
-main() {
-    echo "Fetching all zones..."
-    zones=$(get_zones)
-    
-    # Loop over all zones to find the specified DNS record
-    zone_id=""
-    for zone in $(echo "${zones}" | jq -r '.result[] | @base64'); do
-        _jq() {
-            echo ${zone} | base64 -d | jq -r ${1}
-        }
+record_type_for_ip_version() {
+    if [ "$1" = "4" ]; then
+        echo "A"
+    else
+        echo "AAAA"
+    fi
+}
 
-        # Get the zone name
-        current_zone_name=$(_jq '.name')
-        zone_id=$(_jq '.id')
-        
-        echo "Checking zone: ${current_zone_name}..."
+# Find and update the DNS record for one IP version.
+update_ip_version() {
+    local ip_version="$1"
+    local zones="$2"
+    local record_type
+    local public_ip
+    local update_response
 
-        # Fetch all DNS records for the current zone
-        records=$(get_dns_records "${zone_id}")
-        
-        # Look for the DNS record in this zone
-        record_id=$(echo "${records}" | jq -r ".result[] | select(.type == \"A\" and .name == \"${DNS_RECORD_NAME}\") | .id")
-        
-        if [ ! -z "${record_id}" ]; then
-            echo "Found A record in zone ${current_zone_name}."
-            
-            # Get the current IP of the existing A record
-            current_ip=$(get_current_record_ip "${zone_id}" "${DNS_RECORD_NAME}")
-            public_ip=$(get_public_ip)
-            
-            if [ "$current_ip" != "$public_ip" ]; then
-                echo "IP address has changed. Updating A record from ${current_ip} to ${public_ip}..."
-                
-                # Update the DNS A record with the new IP
-                update_dns_record "${zone_id}" "${record_id}" "${public_ip}"
-                echo "A record updated successfully."
-            else
-                echo "IP address is the same. No update needed."
-            fi
-            
-            # Exit the loop and continue checking after the interval
-            echo "Waiting ${CHECK_INTERVAL_MINUTES} minutes before the next check..."
+    record_type=$(record_type_for_ip_version "${ip_version}")
+
+    if ! public_ip=$(get_public_ip "${ip_version}"); then
+        echo "Could not retrieve the public IPv${ip_version} address. Skipping ${record_type} record."
+        return 1
+    fi
+
+    if [ -z "${public_ip}" ]; then
+        echo "Public IPv${ip_version} address is empty. Skipping ${record_type} record."
+        return 1
+    fi
+
+    echo "Public IPv${ip_version} address: ${public_ip}"
+
+    for encoded_zone in $(echo "${zones}" | jq -r '.result[] | @base64'); do
+        zone=$(echo "${encoded_zone}" | base64 -d)
+        current_zone_name=$(echo "${zone}" | jq -r '.name')
+        zone_id=$(echo "${zone}" | jq -r '.id')
+
+        echo "Checking ${record_type} record in zone: ${current_zone_name}..."
+
+        if ! records=$(get_dns_records "${zone_id}"); then
+            echo "Could not retrieve DNS records for zone ${current_zone_name}."
+            continue
+        fi
+
+        record=$(echo "${records}" | jq -c \
+            --arg type "${record_type}" \
+            --arg name "${DNS_RECORD_NAME}" \
+            '.result[] | select(.type == $type and .name == $name)' | head -n 1)
+
+        if [ -z "${record}" ]; then
+            continue
+        fi
+
+        record_id=$(echo "${record}" | jq -r '.id')
+        current_ip=$(echo "${record}" | jq -r '.content')
+
+        if [ "${current_ip}" = "${public_ip}" ]; then
+            echo "${record_type} record already has the current IPv${ip_version} address. No update needed."
             return 0
         fi
+
+        echo "IPv${ip_version} address has changed. Updating ${record_type} record from ${current_ip} to ${public_ip}..."
+
+        if update_response=$(update_dns_record "${zone_id}" "${record_id}" "${record_type}" "${public_ip}") &&
+            echo "${update_response}" | jq -e '.success == true' > /dev/null; then
+            echo "${record_type} record updated successfully."
+        else
+            echo "Failed to update ${record_type} record."
+            return 1
+        fi
+
+        return 0
     done
 
-    # If the record wasn't found in any zone, print a message
-    echo "A record ${DNS_RECORD_NAME} not found in any zone."
+    echo "${record_type} record ${DNS_RECORD_NAME} not found in any zone."
+    return 1
 }
 
-# Infinite loop to periodically check DNS record every X minutes
+main() {
+    echo "Fetching all zones..."
+
+    if ! zones=$(get_zones); then
+        echo "Could not retrieve Cloudflare zones."
+        return 1
+    fi
+
+    case "${IP_VERSION}" in
+        4)
+            update_ip_version "4" "${zones}"
+            ;;
+        6)
+            update_ip_version "6" "${zones}"
+            ;;
+        4,6|6,4)
+            update_ip_version "4" "${zones}"
+            update_ip_version "6" "${zones}"
+            ;;
+    esac
+}
+
+validate_configuration
+
+# Periodically check DNS records.
 while true; do
     main
     echo "Waiting for ${CHECK_INTERVAL_MINUTES} minute(s) before the next check..."
-    sleep ${CHECK_INTERVAL_SECONDS}  # Wait for the specified interval
+    sleep "${CHECK_INTERVAL_SECONDS}"
 done
